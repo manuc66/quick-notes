@@ -625,10 +625,10 @@ fn subscription(_state: &AppState) -> iced::Subscription<Message> {
         iced::keyboard::listen().filter_map(|event| {
             if let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event {
                 if modifiers.contains(iced::keyboard::Modifiers::CTRL) {
-                    if let Key::Character(c) = &key {
-                        if c.as_str() == "s" {
-                            return Some(Message::Save);
-                        }
+                    match &key {
+                        Key::Character(c) if c.as_str() == "s" => return Some(Message::Save),
+                        Key::Named(iced::keyboard::key::Named::Enter) => return Some(Message::Save),
+                        _ => {}
                     }
                 }
             }
