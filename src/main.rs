@@ -1,5 +1,6 @@
 use chrono::{DateTime, Local};
-use iced::widget::{button, container, row, scrollable, text, text_input, Column};
+use iced::widget::{button, container, mouse_area, row, scrollable, text, text_input, Column};
+use iced::widget::operation::focus;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::PathBuf;
@@ -37,7 +38,6 @@ impl NoteFile {
     }
 
     fn delete(id: &str) {
-        // Remove both .json (current) and legacy .txt files
         let _ = fs::remove_file(NOTES_DIR.join(format!("{}.json", id)));
         let _ = fs::remove_file(NOTES_DIR.join(format!("{}.txt", id)));
     }
@@ -60,50 +60,37 @@ impl From<NoteFile> for Note {
 
 // ─── Confirm state ────────────────────────────────────────────────────────────
 
-/// Distinguishes what we're confirming so the dialog can route correctly.
 #[derive(Debug, Clone, PartialEq)]
 enum ConfirmState {
     None,
-    /// Pending delete of a single note by ID.
     DeleteOne(String),
-    /// Pending delete-all.
     DeleteAll,
-    /// User tried to Load a note while editor has unsaved content.
-    /// Carries the ID of the note they want to load.
+    /// Carries the ID of the note the user wants to load
     UnsavedWorkBeforeLoad(String),
-    /// User hit Clear while editing an existing note with unsaved changes.
     UnsavedWorkBeforeClear,
 }
 
 // ─── Messages ─────────────────────────────────────────────────────────────────
 
+// Stable widget ID for the search input so we can re-focus it after each keystroke
+const SEARCH_ID: &str = "search_input";
+
 #[derive(Debug, Clone)]
 enum Message {
-    /// text_editor action (keypress, cursor move, …)
     Edit(Action),
-    /// Save new note or commit edits to existing one
     Save,
-    /// Discard editor contents, exit edit mode
     Clear,
-    /// Load a note into the editor (may trigger UnsavedWork confirm)
+    /// Click on a note row (or Load button) — triggers load with dirty check
     LoadNote(String),
-    /// Confirmed: discard editor content and load the pending note
     ConfirmLoad(String),
-    /// Cancelled: keep editor content, dismiss dialog
     CancelLoad,
-    /// First press: request delete confirmation
     DeleteNote(String),
-    /// Second press: actually delete
     ConfirmDeleteNote(String),
-    /// First press: request delete-all confirmation
     DeleteAllNotes,
-    /// Second press: actually delete all
     ConfirmDeleteAll,
-    /// Cancel any pending confirmation
     CancelConfirm,
     SearchChanged(String),
     ClearSearch,
-    /// Window close requested (Ctrl+Q or title-bar X)
     CloseWindow(iced::window::Id),
 }
 
@@ -113,7 +100,6 @@ struct AppState {
     notes: Vec<Note>,
     editor: iced::widget::text_editor::Content,
     search_query: String,
-    /// ID of the note currently loaded into the editor (edit mode)
     editing_id: Option<String>,
     confirm_state: ConfirmState,
 }
@@ -147,13 +133,12 @@ fn load_all_notes() -> Vec<Note> {
                     if f.content.trim().is_empty() { return None; }
                     Some(Note::from(f))
                 }
-                // Migrate legacy .txt files on first load
                 Some("txt") => {
+                    // Migrate legacy files
                     let content = fs::read_to_string(&path).ok()?;
                     if content.trim().is_empty() { return None; }
                     let f = NoteFile::new(content);
                     f.save().ok();
-                    // Remove old file after successful migration
                     let _ = fs::remove_file(&path);
                     Some(Note::from(f))
                 }
@@ -165,30 +150,23 @@ fn load_all_notes() -> Vec<Note> {
     notes
 }
 
-/// Returns the full text of the editor, with the trailing newline that
-/// `text_editor::Content::text()` always appends stripped off.
 fn editor_text(content: &iced::widget::text_editor::Content) -> String {
-    let s = content.text();
-    s.trim_end_matches('\n').to_string()
+    content.text().trim_end_matches('\n').to_string()
 }
 
-/// Safe Unicode-aware truncation at a word boundary.
+/// Unicode-aware word-boundary truncation.
 fn truncate_at_word(s: &str, max_chars: usize) -> String {
-    let char_count = s.chars().count();
-    if char_count <= max_chars {
+    if s.chars().count() <= max_chars {
         return s.to_string();
     }
-    // Find byte offset of the max_chars-th character
     let byte_end = s.char_indices()
         .nth(max_chars)
         .map(|(i, _)| i)
         .unwrap_or(s.len());
     let cut = &s[..byte_end];
-    // Walk back to a word boundary
-    if let Some(last_space) = cut.rfind(' ') {
-        format!("{}...", &cut[..last_space])
-    } else {
-        format!("{}...", cut)
+    match cut.rfind(' ') {
+        Some(sp) => format!("{}...", &cut[..sp]),
+        None => format!("{}...", cut),
     }
 }
 
@@ -200,30 +178,22 @@ fn new_state() -> AppState {
 
 fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
     match message {
-        // ── Editor input ──────────────────────────────────────────────────────
         Message::Edit(action) => {
             state.editor.perform(action);
             iced::Task::none()
         }
 
-        // ── Save / Update ─────────────────────────────────────────────────────
         Message::Save => {
             let content = editor_text(&state.editor);
             if content.trim().is_empty() {
                 return iced::Task::none();
             }
-
-            if let Some(ref editing_id) = state.editing_id.clone() {
-                // Update existing note
-                if let Some(note) = state.notes.iter_mut().find(|n| n.id == *editing_id) {
+            if let Some(ref eid) = state.editing_id.clone() {
+                if let Some(note) = state.notes.iter_mut().find(|n| n.id == *eid) {
                     if note.content != content {
                         note.content = content.clone();
                         note.timestamp = Local::now().timestamp_millis();
-                        let file = NoteFile {
-                            id: note.id.clone(),
-                            content,
-                            timestamp: note.timestamp,
-                        };
+                        let file = NoteFile { id: note.id.clone(), content, timestamp: note.timestamp };
                         file.save().ok();
                         state.notes.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
                     }
@@ -231,9 +201,8 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
                 state.editor = iced::widget::text_editor::Content::new();
                 state.editing_id = None;
             } else {
-                // New note — silently skip exact duplicates
-                let is_duplicate = state.notes.iter().any(|n| n.content.trim() == content.trim());
-                if !is_duplicate {
+                let is_dup = state.notes.iter().any(|n| n.content.trim() == content.trim());
+                if !is_dup {
                     let file = NoteFile::new(content);
                     file.save().ok();
                     state.notes.insert(0, Note::from(file));
@@ -243,16 +212,14 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        // ── Clear / cancel edit ───────────────────────────────────────────────
         Message::Clear => {
-            if let Some(ref editing_id) = state.editing_id {
+            if let Some(ref eid) = state.editing_id {
                 let content = editor_text(&state.editor);
                 let original = state.notes.iter()
-                    .find(|n| n.id == *editing_id)
+                    .find(|n| n.id == *eid)
                     .map(|n| n.content.as_str())
                     .unwrap_or("");
                 if content != original && !content.trim().is_empty() {
-                    // Unsaved edits — ask before discarding
                     state.confirm_state = ConfirmState::UnsavedWorkBeforeClear;
                     return iced::Task::none();
                 }
@@ -263,7 +230,6 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        // ── Load a note into the editor ───────────────────────────────────────
         Message::LoadNote(id) => {
             let content = editor_text(&state.editor);
             let has_unsaved_new = !content.trim().is_empty() && state.editing_id.is_none();
@@ -279,7 +245,6 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
                 return iced::Task::none();
             }
 
-            // Safe to load directly
             if let Some(note) = state.notes.iter().find(|n| n.id == id) {
                 state.editor = iced::widget::text_editor::Content::with_text(&note.content);
                 state.editing_id = Some(note.id.clone());
@@ -288,7 +253,6 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        // ── Confirmed: discard and load ───────────────────────────────────────
         Message::ConfirmLoad(id) => {
             if let Some(note) = state.notes.iter().find(|n| n.id == id) {
                 state.editor = iced::widget::text_editor::Content::with_text(&note.content);
@@ -298,17 +262,16 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        // ── Cancel any confirm dialog — restores nothing, just dismisses ──────
         Message::CancelLoad | Message::CancelConfirm => {
             state.confirm_state = ConfirmState::None;
             iced::Task::none()
         }
 
-        // ── Delete single (first press = confirm prompt) ──────────────────────
         Message::DeleteNote(id) => {
             state.confirm_state = ConfirmState::DeleteOne(id);
             iced::Task::none()
         }
+
         Message::ConfirmDeleteNote(id) => {
             NoteFile::delete(&id);
             state.notes.retain(|n| n.id != id);
@@ -320,11 +283,11 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        // ── Delete all ────────────────────────────────────────────────────────
         Message::DeleteAllNotes => {
             state.confirm_state = ConfirmState::DeleteAll;
             iced::Task::none()
         }
+
         Message::ConfirmDeleteAll => {
             for note in &state.notes {
                 NoteFile::delete(&note.id);
@@ -336,37 +299,33 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
             iced::Task::none()
         }
 
-        // ── Search ────────────────────────────────────────────────────────────
+        // FIX: re-focus the search field after every keystroke so the user
+        // never has to re-click between characters.
         Message::SearchChanged(q) => {
             state.search_query = q;
-            iced::Task::none()
-        }
-        Message::ClearSearch => {
-            state.search_query.clear();
-            iced::Task::none()
+            focus(iced::widget::Id::new(SEARCH_ID))
         }
 
-        // ── Window close ──────────────────────────────────────────────────────
-        // FIX: use iced::window::close() instead of process::exit().
+        Message::ClearSearch => {
+            state.search_query.clear();
+            focus(iced::widget::Id::new(SEARCH_ID))
+        }
+
         Message::CloseWindow(window_id) => {
             let content = editor_text(&state.editor);
             if !content.trim().is_empty() {
-                if let Some(ref editing_id) = state.editing_id.clone() {
-                    if let Some(note) = state.notes.iter_mut().find(|n| n.id == *editing_id) {
+                if let Some(ref eid) = state.editing_id.clone() {
+                    if let Some(note) = state.notes.iter_mut().find(|n| n.id == *eid) {
                         if note.content != content {
                             note.content = content.clone();
                             note.timestamp = Local::now().timestamp_millis();
-                            let file = NoteFile {
-                                id: note.id.clone(),
-                                content,
-                                timestamp: note.timestamp,
-                            };
+                            let file = NoteFile { id: note.id.clone(), content, timestamp: note.timestamp };
                             file.save().ok();
                         }
                     }
                 } else {
-                    let is_duplicate = state.notes.iter().any(|n| n.content.trim() == content.trim());
-                    if !is_duplicate {
+                    let is_dup = state.notes.iter().any(|n| n.content.trim() == content.trim());
+                    if !is_dup {
                         let file = NoteFile::new(content);
                         file.save().ok();
                     }
@@ -379,15 +338,17 @@ fn update(state: &mut AppState, message: Message) -> iced::Task<Message> {
 
 // ─── View ─────────────────────────────────────────────────────────────────────
 
-fn view(state: &AppState) -> iced::Element<Message> {
+fn view(state: &AppState) -> iced::Element<'_, Message> {
+    let is_filtering = !state.search_query.is_empty();
+
     let filtered: Vec<&Note> = state.notes.iter()
         .filter(|n| {
-            state.search_query.is_empty()
+            !is_filtering
                 || n.content.to_lowercase().contains(&state.search_query.to_lowercase())
         })
         .collect();
 
-    // ── Header label ─────────────────────────────────────────────────────────
+    // ── Editor header label ───────────────────────────────────────────────────
     let (header_text, header_color) = if let Some(ref eid) = state.editing_id {
         match state.notes.iter().find(|n| n.id == *eid) {
             Some(note) if editor_text(&state.editor) != note.content =>
@@ -401,162 +362,188 @@ fn view(state: &AppState) -> iced::Element<Message> {
         ("New Note", iced::Color::from_rgb(0.35, 0.9, 0.55))
     };
 
-    // ── Confirmation dialog (rendered above editor when active) ───────────────
+    // ── Confirmation dialog ───────────────────────────────────────────────────
     let confirm_dialog: Option<iced::Element<Message>> = match &state.confirm_state {
-        ConfirmState::UnsavedWorkBeforeLoad(pending_id) => {
-            let pid = pending_id.clone();
-            Some(
-                container(
-                    Column::new()
-                        .push(text("Unsaved changes will be lost.")
-                            .size(14).color(iced::Color::from_rgb(0.95, 0.5, 0.3)))
-                        .push(text("Discard and load the selected note?")
-                            .size(12).color(iced::Color::from_rgb(0.7, 0.7, 0.75)))
-                        .push(
-                            row![
-                                button("Discard & Load")
-                                    .on_press(Message::ConfirmLoad(pid))
-                                    .padding(8),
-                                button("Keep editing")
-                                    .on_press(Message::CancelLoad)
-                                    .padding(8),
-                            ].spacing(8)
-                        )
-                        .spacing(8)
-                )
-                .padding(12)
-                .into()
-            )
+        ConfirmState::UnsavedWorkBeforeLoad(pid) => {
+            let pid = pid.clone();
+            Some(container(
+                Column::new()
+                    .push(text("Unsaved changes will be lost.")
+                        .size(14).color(iced::Color::from_rgb(0.95, 0.5, 0.3)))
+                    .push(text("Discard and load the selected note?")
+                        .size(12).color(iced::Color::from_rgb(0.7, 0.7, 0.75)))
+                    .push(row![
+                        button("Discard & Load").on_press(Message::ConfirmLoad(pid)).padding(8),
+                        button("Keep editing").on_press(Message::CancelLoad).padding(8),
+                    ].spacing(8))
+                    .spacing(8)
+            ).padding(12).into())
         }
         ConfirmState::UnsavedWorkBeforeClear => {
-            Some(
-                container(
-                    Column::new()
-                        .push(text("Unsaved changes will be lost.")
-                            .size(14).color(iced::Color::from_rgb(0.95, 0.5, 0.3)))
-                        .push(text("Discard changes and clear the editor?")
-                            .size(12).color(iced::Color::from_rgb(0.7, 0.7, 0.75)))
-                        .push(
-                            row![
-                                button("Discard")
-                                    .on_press(Message::CancelConfirm) // reuse cancel; Clear handler will re-run without unsaved state
-                                    .padding(8),
-                                button("Keep editing")
-                                    .on_press(Message::CancelConfirm)
-                                    .padding(8),
-                            ].spacing(8)
-                        )
-                        .spacing(8)
-                )
-                .padding(12)
-                .into()
-            )
+            Some(container(
+                Column::new()
+                    .push(text("Unsaved changes will be lost.")
+                        .size(14).color(iced::Color::from_rgb(0.95, 0.5, 0.3)))
+                    .push(text("Discard changes and clear the editor?")
+                        .size(12).color(iced::Color::from_rgb(0.7, 0.7, 0.75)))
+                    .push(row![
+                        button("Discard").on_press(Message::CancelConfirm).padding(8),
+                        button("Keep editing").on_press(Message::CancelConfirm).padding(8),
+                    ].spacing(8))
+                    .spacing(8)
+            ).padding(12).into())
         }
         _ => None,
     };
 
     // ── Multi-line text editor ────────────────────────────────────────────────
-    let editor = iced::widget::text_editor(&state.editor)
+    let editor_widget = iced::widget::text_editor(&state.editor)
         .on_action(Message::Edit)
         .placeholder("Type your note here...")
         .padding(12)
         .size(15)
         .height(iced::Length::Fixed(120.0));
 
-    // ── Action buttons ────────────────────────────────────────────────────────
+    // ── Save / Clear (Delete All is now at the bottom, away from these) ───────
     let save_label = if state.editing_id.is_some() { "Update (Ctrl+S)" } else { "Save (Ctrl+S)" };
-    let save_btn = button(save_label).on_press(Message::Save).padding(10);
-    let clear_btn = button("Clear").on_press(Message::Clear).padding(10);
+    let buttons = row![
+        button(save_label).on_press(Message::Save).padding(10),
+        button("Clear").on_press(Message::Clear).padding(10),
+    ].spacing(12);
 
-    let delete_all_btn: iced::Element<Message> = match state.confirm_state {
-        ConfirmState::DeleteAll => row![
-            button("Confirm Delete All").on_press(Message::ConfirmDeleteAll).padding(10),
-            button("Cancel").on_press(Message::CancelConfirm).padding(10),
-        ].spacing(8).into(),
-        _ => button("Delete All").on_press(Message::DeleteAllNotes).padding(10).into(),
-    };
-
-    let buttons = row![save_btn, clear_btn, delete_all_btn].spacing(12);
-
-    // ── Search row ────────────────────────────────────────────────────────────
+    // ── Search field ──────────────────────────────────────────────────────────
+    // FIX: stable Id enables text_input::focus() after SearchChanged so focus
+    // is never lost between keystrokes.
+    // FIX: amber border when filtering gives a persistent visual cue.
     let search_field = text_input("Search notes...", &state.search_query)
+        .id(iced::widget::Id::new(SEARCH_ID))
         .on_input(Message::SearchChanged)
         .size(14)
         .padding(8)
-        .width(iced::Length::Fill);
+        .width(iced::Length::Fill)
+        .style(move |theme, status| {
+            let mut s = text_input::default(theme, status);
+            if is_filtering {
+                s.border.color = iced::Color::from_rgb(0.9, 0.7, 0.2);
+                s.border.width = 1.5;
+            }
+            s
+        });
 
-    let search_row: iced::Element<Message> = if state.search_query.is_empty() {
-        search_field.into()
-    } else {
+    // FIX: show live match count and clear button when a filter is active.
+    let search_row: iced::Element<Message> = if is_filtering {
         row![
             search_field,
+            text(format!("{} match", filtered.len()))
+                .size(12)
+                .color(iced::Color::from_rgb(0.9, 0.7, 0.2)),
             button("✕").on_press(Message::ClearSearch).padding(6),
-        ].spacing(8).into()
+        ].spacing(8).align_y(iced::Alignment::Center).into()
+    } else {
+        search_field.into()
     };
 
     // ── Status bar ────────────────────────────────────────────────────────────
-    let status = if state.search_query.is_empty() {
-        format!(
-            "{} chars • {} notes",
-            editor_text(&state.editor).len(),
-            state.notes.len()
-        )
+    let status = format!(
+        "{} chars • {} notes",
+        editor_text(&state.editor).len(),
+        state.notes.len()
+    );
+
+    // ── Section label changes colour + text when filtering ────────────────────
+    let section_label: iced::Element<Message> = if is_filtering {
+        text(format!("FILTERED — {} of {} notes", filtered.len(), state.notes.len()))
+            .size(10)
+            .color(iced::Color::from_rgb(0.9, 0.7, 0.2))
+            .into()
     } else {
-        format!("{} / {} notes", filtered.len(), state.notes.len())
+        text("ALL NOTES")
+            .size(10)
+            .color(iced::Color::from_rgb(0.4, 0.4, 0.45))
+            .into()
     };
 
-    // ── Notes list (scrollable region — search/status live OUTSIDE this) ─────
+    // ── Notes list ────────────────────────────────────────────────────────────
     let mut notes_col = Column::new().spacing(0);
 
     if filtered.is_empty() {
-        let msg = if state.search_query.is_empty() {
-            "No saved notes yet. Type above and press Ctrl+S to save."
-        } else {
+        let msg = if is_filtering {
             "No notes match your search."
+        } else {
+            "No saved notes yet. Type above and press Ctrl+S to save."
         };
         notes_col = notes_col.push(
-            text(msg).size(13).color(iced::Color::from_rgb(0.4, 0.4, 0.45))
+            container(
+                text(msg).size(13).color(iced::Color::from_rgb(0.4, 0.4, 0.45))
+            ).padding(12)
         );
     } else {
-        for note in filtered {
+        for note in &filtered {
             let date = DateTime::from_timestamp_millis(note.timestamp)
                 .map(|dt| dt.format("%d/%m/%y %H:%M").to_string())
                 .unwrap_or_default();
 
-            // Unicode-safe preview; replace newlines for single-line display
             let preview = truncate_at_word(&note.content.replace('\n', " ↵ "), 100);
             let is_editing = state.editing_id.as_deref() == Some(note.id.as_str());
 
-            let actions: iced::Element<Message> = match &state.confirm_state {
-                ConfirmState::DeleteOne(id) if id == &note.id => row![
-                    button("Delete").on_press(Message::ConfirmDeleteNote(note.id.clone())).padding(8),
-                    button("Cancel").on_press(Message::CancelConfirm).padding(8),
-                ].spacing(6).into(),
-                _ => row![
-                    button(if is_editing { "Editing…" } else { "Load" })
-                        .on_press(Message::LoadNote(note.id.clone()))
-                        .padding(10),
-                    button("✕")
-                        .on_press(Message::DeleteNote(note.id.clone()))
-                        .padding(10),
-                ].spacing(8).into(),
+            // FIX: blue-tinted background on the row currently being edited
+            // so the user always knows which note is open in the editor.
+            let row_bg = if is_editing {
+                iced::Color::from_rgb(0.18, 0.22, 0.28)
+            } else {
+                iced::Color::from_rgb(0.12, 0.12, 0.15)
             };
 
-            let note_content = Column::new()
+            // Delete action — only button on the row now
+            let delete_btn: iced::Element<Message> = match &state.confirm_state {
+                ConfirmState::DeleteOne(id) if id == &note.id => row![
+                    button("Delete")
+                        .on_press(Message::ConfirmDeleteNote(note.id.clone()))
+                        .padding(8),
+                    button("Cancel")
+                        .on_press(Message::CancelConfirm)
+                        .padding(8),
+                ].spacing(6).into(),
+                _ => button("✕")
+                    .on_press(Message::DeleteNote(note.id.clone()))
+                    .padding(10)
+                    .into(),
+            };
+
+            // FIX: "← editing" label under the timestamp when this note is
+            // loaded in the editor — visible even without looking at the header.
+            let mut note_col = Column::new()
                 .push(text(preview).size(14).color(iced::Color::from_rgb(0.9, 0.9, 0.95)))
-                .push(text(date).size(11).color(iced::Color::from_rgb(0.75, 0.75, 0.8)))
+                .push(text(date.clone()).size(11).color(iced::Color::from_rgb(0.75, 0.75, 0.8)))
                 .spacing(4);
 
-            notes_col = notes_col.push(
-                container(
-                    row![note_content.width(iced::Length::Fill), actions]
-                        .align_y(iced::Alignment::Center)
-                )
-                .width(iced::Length::Fill)
-                .padding(12)
-            );
+            if is_editing {
+                note_col = note_col.push(
+                    text("← editing")
+                        .size(10)
+                        .color(iced::Color::from_rgb(0.95, 0.75, 0.3))
+                );
+            }
 
-            // Separator line
+            // FIX: mouse_area wraps the entire card — clicking anywhere on
+            // the row loads the note, no separate Load button required.
+            let card = container(
+                row![
+                    note_col.width(iced::Length::Fill),
+                    delete_btn,
+                ].align_y(iced::Alignment::Center)
+            )
+            .width(iced::Length::Fill)
+            .padding(12)
+            .style(move |_| iced::widget::container::Style {
+                background: Some(row_bg.into()),
+                ..Default::default()
+            });
+
+            let clickable_card = mouse_area(card)
+                .on_press(Message::LoadNote(note.id.clone()));
+
+            notes_col = notes_col.push(clickable_card);
             notes_col = notes_col.push(
                 container(text(""))
                     .height(iced::Length::Fixed(1.0))
@@ -569,38 +556,54 @@ fn view(state: &AppState) -> iced::Element<Message> {
         }
     }
 
+    // FIX: Delete All moved to a danger zone anchored at the very bottom of
+    // the window, spatially separated from Save/Clear.
+    let delete_all_zone: iced::Element<Message> = match state.confirm_state {
+        ConfirmState::DeleteAll => container(
+            row![
+                text("Delete ALL notes permanently?")
+                    .size(12)
+                    .color(iced::Color::from_rgb(0.95, 0.4, 0.3)),
+                button("Yes, delete all")
+                    .on_press(Message::ConfirmDeleteAll)
+                    .padding(8),
+                button("Cancel")
+                    .on_press(Message::CancelConfirm)
+                    .padding(8),
+            ].spacing(10).align_y(iced::Alignment::Center)
+        ).padding(iced::Padding::from([8, 20])).into(),
+        _ => container(
+            button("Delete All Notes")
+                .on_press(Message::DeleteAllNotes)
+                .padding(8)
+        ).padding(iced::Padding::from([8, 20])).into(),
+    };
+
     // ── Assemble main layout ─────────────────────────────────────────────────
     let input_section = container(
         Column::new()
             .push(text(header_text).size(14).color(header_color))
-            .push(editor)
+            .push(editor_widget)
             .spacing(8)
-    )
-    .padding(20);
+    ).padding(20);
 
     let mut main = Column::new()
         .push(input_section)
         .push(container(buttons).padding(iced::Padding::from([0, 20])))
-        // Status, search, and section label are fixed — NOT inside the scrollable
-        .push(
-            container(text(status).size(11).color(iced::Color::from_rgb(0.5, 0.5, 0.55)))
-                .padding(iced::Padding::from([0, 20]))
-        )
-        .push(
-            container(search_row).padding(iced::Padding::from([0, 20]))
-        )
-        .push(
-            container(text("ALL NOTES").size(10).color(iced::Color::from_rgb(0.4, 0.4, 0.45)))
-                .padding(iced::Padding::from([4, 20]))
-        )
+        .push(container(
+            text(status).size(11).color(iced::Color::from_rgb(0.5, 0.5, 0.55))
+        ).padding(iced::Padding::from([0, 20])))
+        .push(container(search_row).padding(iced::Padding::from([0, 20])))
+        .push(container(section_label).padding(iced::Padding::from([4, 20])))
         .push(
             scrollable(notes_col)
                 .id(iced::widget::Id::new("notes_scroll"))
                 .height(iced::Length::Fill)
         )
+        // Delete All sits below the scroll, anchored to the window bottom
+        .push(delete_all_zone)
         .spacing(4);
 
-    // Confirmation dialog floats above the rest
     if let Some(dialog) = confirm_dialog {
         main = Column::new().push(dialog).push(main);
     }
@@ -623,16 +626,14 @@ fn subscription(_state: &AppState) -> iced::Subscription<Message> {
             if let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event {
                 if modifiers.contains(iced::keyboard::Modifiers::CTRL) {
                     if let Key::Character(c) = &key {
-                        match c.as_str() {
-                            "s" => return Some(Message::Save),
-                            _ => {}
+                        if c.as_str() == "s" {
+                            return Some(Message::Save);
                         }
                     }
                 }
             }
             None
         }),
-        // FIX: carry the window ID so CloseWindow can call iced::window::close(id)
         iced::window::events().filter_map(|(id, event)| {
             if let Event::CloseRequested = event {
                 Some(Message::CloseWindow(id))
@@ -649,6 +650,6 @@ fn main() -> iced::Result {
     iced::application(new_state, update, view)
         .subscription(subscription)
         .title("Quick Notes")
-        .exit_on_close_request(false) // we handle close manually to auto-save
+        .exit_on_close_request(false)
         .run()
 }
