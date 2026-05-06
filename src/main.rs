@@ -505,16 +505,8 @@ fn view(state: &AppState) -> iced::Element<Message> {
         format!("{} / {} notes", filtered.len(), state.notes.len())
     };
 
-    // ── Notes list ────────────────────────────────────────────────────────────
+    // ── Notes list (scrollable region — search/status live OUTSIDE this) ─────
     let mut notes_col = Column::new().spacing(0);
-
-    notes_col = notes_col.push(
-        container(text(status).size(11).color(iced::Color::from_rgb(0.5, 0.5, 0.55)))
-    );
-    notes_col = notes_col.push(container(search_row));
-    notes_col = notes_col.push(
-        container(text("ALL NOTES").size(10).color(iced::Color::from_rgb(0.4, 0.4, 0.45)))
-    );
 
     if filtered.is_empty() {
         let msg = if state.search_query.is_empty() {
@@ -589,12 +581,24 @@ fn view(state: &AppState) -> iced::Element<Message> {
     let mut main = Column::new()
         .push(input_section)
         .push(container(buttons).padding(iced::Padding::from([0, 20])))
+        // Status, search, and section label are fixed — NOT inside the scrollable
+        .push(
+            container(text(status).size(11).color(iced::Color::from_rgb(0.5, 0.5, 0.55)))
+                .padding(iced::Padding::from([0, 20]))
+        )
+        .push(
+            container(search_row).padding(iced::Padding::from([0, 20]))
+        )
+        .push(
+            container(text("ALL NOTES").size(10).color(iced::Color::from_rgb(0.4, 0.4, 0.45)))
+                .padding(iced::Padding::from([4, 20]))
+        )
         .push(
             scrollable(notes_col)
                 .id(iced::widget::Id::new("notes_scroll"))
                 .height(iced::Length::Fill)
         )
-        .spacing(10);
+        .spacing(4);
 
     // Confirmation dialog floats above the rest
     if let Some(dialog) = confirm_dialog {
